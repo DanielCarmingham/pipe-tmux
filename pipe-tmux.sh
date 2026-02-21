@@ -94,6 +94,54 @@ validate() {
     command -v ii >/dev/null || die "ii not found in PATH"
 }
 
+cleanup() {
+    log "cleaning up..."
+    tmux pipe-pane -t "$TARGET" "" 2>/dev/null || true
+    for pid in "${PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf "$IRCDIR"
+    log "done"
+}
+
+wait_for_connection() {
+    local server_dir="$IRCDIR/$SERVER"
+    local attempts=0
+    log "connecting to $SERVER..."
+    while [[ ! -p "$server_dir/in" ]]; do
+        sleep 0.5
+        attempts=$((attempts + 1))
+        [[ $attempts -ge 60 ]] && die "timeout connecting to $SERVER"
+    done
+    log "connected to $SERVER"
+}
+
+join_channel() {
+    local server_dir="$IRCDIR/$SERVER"
+    echo "/j $CHANNEL" > "$server_dir/in"
+    local chan_dir="$server_dir/$CHANNEL"
+    local attempts=0
+    log "joining $CHANNEL..."
+    while [[ ! -p "$chan_dir/in" ]]; do
+        sleep 0.5
+        attempts=$((attempts + 1))
+        [[ $attempts -ge 30 ]] && die "timeout joining $CHANNEL"
+    done
+    log "joined $CHANNEL"
+}
+
+run_startup() {
+    if ! $SKIP_DEFAULTS; then
+        log "disabling tmux status bar"
+        tmux set-option -t "$TARGET" status off 2>/dev/null || true
+    fi
+    for cmd in "${STARTUP_CMDS[@]}"; do
+        log "startup: tmux $cmd"
+        eval "tmux $cmd" 2>/dev/null || log "startup command failed: tmux $cmd"
+    done
+}
+
 main() {
     # Pre-pass: extract -f before loading config
     local args=("$@")
@@ -109,6 +157,25 @@ main() {
     validate
 
     log "config: server=$SERVER port=$PORT channel=$CHANNEL target=$TARGET nick=$NICK debounce=$DEBOUNCE"
+
+    trap cleanup EXIT
+
+    mkdir -p "$IRCDIR"
+
+    # Start ii in background
+    ii -s "$SERVER" -p "$PORT" -n "$NICK" -i "$IRCDIR" &
+    PIDS+=($!)
+    log "started ii (pid $!)"
+
+    wait_for_connection
+    join_channel
+    run_startup
+
+    log "bridge ready: $TARGET <-> $CHANNEL@$SERVER"
+    log "press Ctrl+C to stop"
+
+    # Placeholder: wait for interrupt
+    wait
 }
 
 main "$@"
