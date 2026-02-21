@@ -114,6 +114,14 @@ wait_for_connection() {
         attempts=$((attempts + 1))
         [[ $attempts -ge 60 ]] && die "timeout connecting to $SERVER"
     done
+    # Wait for server welcome before sending commands
+    local out="$server_dir/out"
+    attempts=0
+    while ! grep -q "Welcome to" "$out" 2>/dev/null; do
+        sleep 0.5
+        attempts=$((attempts + 1))
+        [[ $attempts -ge 60 ]] && die "timeout waiting for server welcome"
+    done
     log "connected to $SERVER"
 }
 
