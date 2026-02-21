@@ -171,8 +171,8 @@ start_tmux_to_irc() {
     local pane_output="$IRCDIR/pane_output"
     : > "$pane_output"
 
-    # Pipe pane output, stripping ANSI escape codes
-    tmux pipe-pane -t "$TARGET" "sed -u 's/\x1b\[[^@-~]*[@-~]//g; s/\x1b[()][A-Z0-9]//g; s/\r//g' >> '$pane_output'"
+    # Pipe pane output, stripping ANSI escape codes and control sequences
+    tmux pipe-pane -t "$TARGET" "perl -pe 'BEGIN{\$|=1} s/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b\].*?\x07//g; s/\x1b\([A-Z0-9]//g; s/\x1b[=>]//g; s/\x1b\[[\?]?[0-9;]*[a-zA-Z]//g; s/\r//g' >> '$pane_output'"
     log "started tmux output capture"
 
     (
@@ -209,10 +209,12 @@ start_irc_to_tmux() {
 
     (
         tail -n 0 -f "$irc_out" | while IFS= read -r line; do
-            # Parse ii format: YYYY-MM-DD HH:MM <nick> message
-            if [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}\ \<([^>]+)\>\ (.*)$ ]]; then
+            # Parse ii format: TIMESTAMP <nick> message (timestamp may be unix or YYYY-MM-DD HH:MM)
+            if [[ "$line" =~ ^[0-9]+\ \<([^>]+)\>\ (.*)$ ]] || [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}\ \<([^>]+)\>\ (.*)$ ]]; then
+                # Handle both timestamp formats
                 local sender="${BASH_REMATCH[1]}"
                 local msg="${BASH_REMATCH[2]}"
+                [[ -z "$sender" ]] && sender="${BASH_REMATCH[3]}" && msg="${BASH_REMATCH[4]}"
 
                 # Skip own messages
                 [[ "$sender" == "$NICK" ]] && continue
