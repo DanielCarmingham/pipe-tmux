@@ -205,17 +205,29 @@ flush_to_irc() {
     local irc_in="$2"
     # Convert ANSI colors to IRC colors
     text=$(printf '%s\n' "$text" | ansi_to_irc)
+    local buf=""
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        # Split lines longer than 450 chars
-        while [[ ${#line} -gt 450 ]]; do
-            echo "${line:0:450}" > "$irc_in"
-            line="${line:450}"
+        if [[ -z "$buf" ]]; then
+            buf="$line"
+        elif [[ $(( ${#buf} + 3 + ${#line} )) -le 450 ]]; then
+            # Fits in current message, accumulate with separator
+            buf="$buf | $line"
+        else
+            # Would exceed limit, send current buffer and start new one
+            echo "$buf" > "$irc_in"
             sleep 0.1
+            buf="$line"
+        fi
+        # Split if single line exceeds 450
+        while [[ ${#buf} -gt 450 ]]; do
+            echo "${buf:0:450}" > "$irc_in"
+            sleep 0.1
+            buf="${buf:450}"
         done
-        [[ -n "$line" ]] && echo "$line" > "$irc_in"
-        sleep 0.1
     done <<< "$text"
+    # Send remaining buffer
+    [[ -n "$buf" ]] && echo "$buf" > "$irc_in"
 }
 
 start_tmux_to_irc() {
