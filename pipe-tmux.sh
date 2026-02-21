@@ -191,6 +191,42 @@ start_tmux_to_irc() {
     log "started debounce loop (pid $!)"
 }
 
+start_irc_to_tmux() {
+    local irc_out="$IRCDIR/$SERVER/$CHANNEL/out"
+
+    # Wait for out file to exist
+    while [[ ! -f "$irc_out" ]]; do
+        sleep 0.5
+    done
+
+    (
+        tail -n 0 -f "$irc_out" | while IFS= read -r line; do
+            # Parse ii format: YYYY-MM-DD HH:MM <nick> message
+            if [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}\ \<([^>]+)\>\ (.*)$ ]]; then
+                local sender="${BASH_REMATCH[1]}"
+                local msg="${BASH_REMATCH[2]}"
+
+                # Skip own messages
+                [[ "$sender" == "$NICK" ]] && continue
+
+                if [[ "$msg" == !* ]]; then
+                    # Key sequence mode
+                    local keys="${msg#!}"
+                    log "keys from $sender: $keys"
+                    eval "tmux send-keys -t '$TARGET' $keys"
+                else
+                    # Literal text + Enter
+                    log "text from $sender: $msg"
+                    tmux send-keys -t "$TARGET" -l "$msg"
+                    tmux send-keys -t "$TARGET" Enter
+                fi
+            fi
+        done
+    ) &
+    PIDS+=($!)
+    log "started IRC listener (pid $!)"
+}
+
 main() {
     # Pre-pass: extract -f before loading config
     local args=("$@")
@@ -223,6 +259,7 @@ main() {
     log "bridge ready: $TARGET <-> $CHANNEL@$SERVER"
 
     start_tmux_to_irc
+    start_irc_to_tmux
 
     log "press Ctrl+C to stop"
     wait
