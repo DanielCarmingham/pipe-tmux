@@ -90,17 +90,25 @@ validate() {
     [[ -n "$SERVER" ]]  || die "server (-s) is required"
     [[ -n "$CHANNEL" ]] || die "channel (-c) is required"
     [[ -n "$TARGET" ]]  || die "target pane (-t) is required"
-    tmux has-session -t "${TARGET%%.*}" 2>/dev/null || die "tmux target '$TARGET' not found"
     command -v ii >/dev/null || die "ii not found in PATH"
+    if ! tmux has-session -t "${TARGET%%.*}" 2>/dev/null; then
+        log "warning: tmux target '$TARGET' not found, will wait for it"
+    fi
 }
 
-cleanup() {
-    log "cleaning up..."
-    tmux pipe-pane -t "$TARGET" "" 2>/dev/null || true
+stop_children() {
     for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
+    PIDS=()
+}
+
+cleanup() {
+    log "cleaning up..."
+    RECONNECT=false
+    tmux pipe-pane -t "$TARGET" "" 2>/dev/null || true
+    stop_children
     rm -rf "$IRCDIR"
     log "done"
 }
@@ -112,7 +120,10 @@ wait_for_connection() {
     while [[ ! -p "$server_dir/in" ]]; do
         sleep 0.5
         attempts=$((attempts + 1))
-        [[ $attempts -ge 60 ]] && die "timeout connecting to $SERVER"
+        if [[ $attempts -ge 60 ]]; then
+            log "timeout connecting to $SERVER"
+            return 1
+        fi
     done
     # Wait for server welcome before sending commands
     local out="$server_dir/out"
@@ -120,7 +131,10 @@ wait_for_connection() {
     while ! grep -q "Welcome to" "$out" 2>/dev/null; do
         sleep 0.5
         attempts=$((attempts + 1))
-        [[ $attempts -ge 60 ]] && die "timeout waiting for server welcome"
+        if [[ $attempts -ge 60 ]]; then
+            log "timeout waiting for server welcome"
+            return 1
+        fi
     done
     log "connected to $SERVER"
 }
@@ -134,7 +148,10 @@ join_channel() {
     while [[ ! -p "$chan_dir/in" ]]; do
         sleep 0.5
         attempts=$((attempts + 1))
-        [[ $attempts -ge 30 ]] && die "timeout joining $CHANNEL"
+        if [[ $attempts -ge 30 ]]; then
+            log "timeout joining $CHANNEL"
+            return 1
+        fi
     done
     log "joined $CHANNEL"
 }
@@ -205,78 +222,77 @@ flush_to_irc() {
     local irc_in="$2"
     # Convert ANSI colors to IRC colors
     text=$(printf '%s\n' "$text" | ansi_to_irc)
-    local buf=""
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        if [[ -z "$buf" ]]; then
-            buf="$line"
-        elif [[ $(( ${#buf} + 3 + ${#line} )) -le 450 ]]; then
-            # Fits in current message, accumulate with separator
-            buf="$buf | $line"
-        else
-            # Would exceed limit, send current buffer and start new one
-            echo "$buf" > "$irc_in"
-            sleep 0.1
-            buf="$line"
-        fi
-        # Split if single line exceeds 450
-        while [[ ${#buf} -gt 450 ]]; do
-            echo "${buf:0:450}" > "$irc_in"
-            sleep 0.1
-            buf="${buf:450}"
+        # Filter status bar lines (progress indicators, separators)
+        [[ "$line" =~ ^─+$ ]] && continue
+        [[ "$line" =~ [🕐🧠⏳💰] ]] && continue
+        # Split lines longer than 450 chars
+        while [[ ${#line} -gt 450 ]]; do
+            echo "${line:0:450}" > "$irc_in"
+            line="${line:450}"
         done
+        [[ -n "$line" ]] && echo "$line" > "$irc_in"
     done <<< "$text"
-    # Send remaining buffer
-    [[ -n "$buf" ]] && echo "$buf" > "$irc_in"
 }
 
 start_tmux_to_irc() {
     local irc_in="$IRCDIR/$SERVER/$CHANNEL/in"
 
     (
-        # Capture initial scrollback state
-        local prev
-        prev=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || true
-        local prev_count
-        prev_count=$(printf '%s\n' "$prev" | wc -l)
-
         while true; do
-            sleep 0.5
-
-            local curr
-            curr=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || break
-            local curr_count
-            curr_count=$(printf '%s\n' "$curr" | wc -l)
-
-            # No change
-            [[ "$curr" == "$prev" ]] && continue
-
-            # Something changed, debounce until stable
-            local last_change=$SECONDS
-            while (( SECONDS - last_change < DEBOUNCE )); do
-                sleep 0.5
-                local check
-                check=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || break 2
-                if [[ "$check" != "$curr" ]]; then
-                    curr="$check"
-                    curr_count=$(printf '%s\n' "$curr" | wc -l)
-                    last_change=$SECONDS
-                fi
+            # Wait for pane to be available
+            while ! tmux has-session -t "${TARGET%%.*}" 2>/dev/null; do
+                sleep 2
             done
 
-            # Stable - extract and send new lines
-            if [[ $curr_count -gt $prev_count ]]; then
-                local new_lines
-                new_lines=$(printf '%s\n' "$curr" | tail -n +$((prev_count + 1)))
-                # Trim trailing whitespace and skip empty lines
-                new_lines=$(printf '%s\n' "$new_lines" | sed 's/[[:space:]]*$//; /^$/d')
-                if [[ -n "$new_lines" ]]; then
-                    flush_to_irc "$new_lines" "$irc_in"
-                fi
-            fi
+            # Capture initial scrollback state
+            local prev
+            prev=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || { sleep 2; continue; }
+            local prev_count
+            prev_count=$(printf '%s\n' "$prev" | wc -l)
+            log "output capture connected to $TARGET"
 
-            prev="$curr"
-            prev_count=$curr_count
+            while true; do
+                sleep 0.5
+
+                local curr
+                curr=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || break
+                local curr_count
+                curr_count=$(printf '%s\n' "$curr" | wc -l)
+
+                # No change
+                [[ "$curr" == "$prev" ]] && continue
+
+                # Something changed, debounce until stable
+                local last_change=$SECONDS
+                while (( SECONDS - last_change < DEBOUNCE )); do
+                    sleep 0.5
+                    local check
+                    check=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || break 2
+                    if [[ "$check" != "$curr" ]]; then
+                        curr="$check"
+                        curr_count=$(printf '%s\n' "$curr" | wc -l)
+                        last_change=$SECONDS
+                    fi
+                done
+
+                # Stable - extract and send new lines
+                if [[ $curr_count -gt $prev_count ]]; then
+                    local new_lines
+                    new_lines=$(printf '%s\n' "$curr" | tail -n +$((prev_count + 1)))
+                    # Trim trailing whitespace and skip empty lines
+                    new_lines=$(printf '%s\n' "$new_lines" | sed 's/[[:space:]]*$//; /^$/d')
+                    if [[ -n "$new_lines" ]]; then
+                        flush_to_irc "$new_lines" "$irc_in"
+                    fi
+                fi
+
+                prev="$curr"
+                prev_count=$curr_count
+            done
+
+            log "pane $TARGET lost, waiting for reconnect..."
         done
     ) &
     PIDS+=($!)
@@ -302,6 +318,11 @@ start_irc_to_tmux() {
 
                 # Skip own messages
                 [[ "$sender" == "$NICK" ]] && continue
+
+                # Wait for pane if it's gone
+                while ! tmux has-session -t "${TARGET%%.*}" 2>/dev/null; do
+                    sleep 2
+                done
 
                 if [[ "$msg" == !* ]]; then
                     # Key sequence mode
@@ -329,6 +350,33 @@ start_irc_to_tmux() {
     log "started IRC listener (pid $!)"
 }
 
+RECONNECT=true
+RECONNECT_DELAY=5
+
+connect_and_bridge() {
+    mkdir -p "$IRCDIR"
+
+    # Start ii in background
+    ii -s "$SERVER" -p "$PORT" -n "$NICK" -i "$IRCDIR" &
+    local ii_pid=$!
+    PIDS+=($ii_pid)
+    log "started ii (pid $ii_pid)"
+
+    wait_for_connection || return 1
+    join_channel || return 1
+    run_startup
+
+    log "bridge ready: $TARGET <-> $CHANNEL@$SERVER"
+
+    start_tmux_to_irc
+    start_irc_to_tmux
+
+    # Wait for ii to exit (means connection lost)
+    wait "$ii_pid" 2>/dev/null
+    log "ii exited (connection lost)"
+    return 1
+}
+
 main() {
     # Pre-pass: extract -f before loading config
     local args=("$@")
@@ -347,24 +395,20 @@ main() {
 
     trap cleanup EXIT
 
-    mkdir -p "$IRCDIR"
-
-    # Start ii in background
-    ii -s "$SERVER" -p "$PORT" -n "$NICK" -i "$IRCDIR" &
-    PIDS+=($!)
-    log "started ii (pid $!)"
-
-    wait_for_connection
-    join_channel
-    run_startup
-
-    log "bridge ready: $TARGET <-> $CHANNEL@$SERVER"
-
-    start_tmux_to_irc
-    start_irc_to_tmux
-
     log "press Ctrl+C to stop"
-    wait
+
+    while $RECONNECT; do
+        connect_and_bridge || true
+
+        # Clean up for reconnect
+        stop_children
+        rm -rf "$IRCDIR"
+
+        if $RECONNECT; then
+            log "reconnecting in ${RECONNECT_DELAY}s..."
+            sleep "$RECONNECT_DELAY"
+        fi
+    done
 }
 
 main "$@"
