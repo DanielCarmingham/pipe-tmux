@@ -142,6 +142,55 @@ run_startup() {
     done
 }
 
+flush_to_irc() {
+    local text="$1"
+    local irc_in="$2"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # Split lines longer than 450 chars
+        while [[ ${#line} -gt 450 ]]; do
+            echo "${line:0:450}" > "$irc_in"
+            line="${line:450}"
+            sleep 0.1
+        done
+        [[ -n "$line" ]] && echo "$line" > "$irc_in"
+        sleep 0.1
+    done <<< "$text"
+}
+
+start_tmux_to_irc() {
+    local irc_in="$IRCDIR/$SERVER/$CHANNEL/in"
+    local pane_output="$IRCDIR/pane_output"
+    : > "$pane_output"
+
+    # Pipe pane output, stripping ANSI escape codes
+    tmux pipe-pane -t "$TARGET" "sed -u 's/\x1b\[[^@-~]*[@-~]//g; s/\x1b[()][A-Z0-9]//g; s/\r//g' >> '$pane_output'"
+    log "started tmux output capture"
+
+    (
+        local buffer=""
+        while true; do
+            if IFS= read -r -t "$DEBOUNCE" line; then
+                buffer+="$line"$'\n'
+            else
+                local status=$?
+                if [[ -n "$buffer" ]]; then
+                    flush_to_irc "$buffer" "$irc_in"
+                    buffer=""
+                fi
+                # Truncate file if over 1MB
+                if [[ $(stat -c%s "$pane_output" 2>/dev/null || echo 0) -gt 1048576 ]]; then
+                    : > "$pane_output"
+                fi
+                # EOF (not timeout) means pipe closed
+                [[ $status -le 128 ]] && break
+            fi
+        done < <(tail -n 0 -f "$pane_output")
+    ) &
+    PIDS+=($!)
+    log "started debounce loop (pid $!)"
+}
+
 main() {
     # Pre-pass: extract -f before loading config
     local args=("$@")
@@ -172,9 +221,10 @@ main() {
     run_startup
 
     log "bridge ready: $TARGET <-> $CHANNEL@$SERVER"
-    log "press Ctrl+C to stop"
 
-    # Placeholder: wait for interrupt
+    start_tmux_to_irc
+
+    log "press Ctrl+C to stop"
     wait
 }
 
