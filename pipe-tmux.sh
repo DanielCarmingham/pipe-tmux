@@ -150,9 +150,61 @@ run_startup() {
     done
 }
 
+ansi_to_irc() {
+    # Convert ANSI escape codes to IRC color/formatting codes
+    # IRC: \x03FG[,BG] for color, \x02 bold, \x0F reset, \x1D italic, \x1F underline
+    perl -pe '
+        # Bold
+        s/\x1b\[1m/\x02/g;
+        # Italic
+        s/\x1b\[3m/\x1d/g;
+        # Underline
+        s/\x1b\[4m/\x1f/g;
+        # Reset
+        s/\x1b\[0?m/\x0f/g;
+        # Foreground colors: ANSI 30-37 -> IRC
+        s/\x1b\[30m/\x0301/g;  # black
+        s/\x1b\[31m/\x0304/g;  # red
+        s/\x1b\[32m/\x0303/g;  # green
+        s/\x1b\[33m/\x0308/g;  # yellow
+        s/\x1b\[34m/\x0302/g;  # blue
+        s/\x1b\[35m/\x0306/g;  # magenta
+        s/\x1b\[36m/\x0310/g;  # cyan
+        s/\x1b\[37m/\x0300/g;  # white
+        # Default foreground
+        s/\x1b\[39m/\x0f/g;
+        # Bright/bold foreground: ANSI 90-97 -> IRC
+        s/\x1b\[90m/\x0314/g;  # bright black (grey)
+        s/\x1b\[91m/\x0305/g;  # bright red
+        s/\x1b\[92m/\x0309/g;  # bright green
+        s/\x1b\[93m/\x0308/g;  # bright yellow
+        s/\x1b\[94m/\x0312/g;  # bright blue
+        s/\x1b\[95m/\x0313/g;  # bright magenta
+        s/\x1b\[96m/\x0311/g;  # bright cyan
+        s/\x1b\[97m/\x0300/g;  # bright white
+        # Combined sequences like \x1b[1;31m (bold+color)
+        s/\x1b\[1;30m/\x02\x0301/g;
+        s/\x1b\[1;31m/\x02\x0304/g;
+        s/\x1b\[1;32m/\x02\x0303/g;
+        s/\x1b\[1;33m/\x02\x0308/g;
+        s/\x1b\[1;34m/\x02\x0302/g;
+        s/\x1b\[1;35m/\x02\x0306/g;
+        s/\x1b\[1;36m/\x02\x0310/g;
+        s/\x1b\[1;37m/\x02\x0300/g;
+        # Strip any remaining ANSI sequences we do not convert
+        s/\x1b\[[0-9;]*[a-zA-Z]//g;
+        s/\x1b\][^\x07]*\x07//g;
+        s/\x1b\([A-Z0-9]//g;
+        s/\x1b[=>]//g;
+        s/\r//g;
+    '
+}
+
 flush_to_irc() {
     local text="$1"
     local irc_in="$2"
+    # Convert ANSI colors to IRC colors
+    text=$(printf '%s\n' "$text" | ansi_to_irc)
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         # Split lines longer than 450 chars
@@ -168,35 +220,55 @@ flush_to_irc() {
 
 start_tmux_to_irc() {
     local irc_in="$IRCDIR/$SERVER/$CHANNEL/in"
-    local pane_output="$IRCDIR/pane_output"
-    : > "$pane_output"
-
-    # Pipe pane output, stripping ANSI escape codes and control sequences
-    tmux pipe-pane -t "$TARGET" "perl -pe 'BEGIN{\$|=1} s/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b\].*?\x07//g; s/\x1b\([A-Z0-9]//g; s/\x1b[=>]//g; s/\x1b\[[\?]?[0-9;]*[a-zA-Z]//g; s/\r//g' >> '$pane_output'"
-    log "started tmux output capture"
 
     (
-        local buffer=""
+        # Capture initial scrollback state
+        local prev
+        prev=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || true
+        local prev_count
+        prev_count=$(printf '%s\n' "$prev" | wc -l)
+
         while true; do
-            if IFS= read -r -t "$DEBOUNCE" line; then
-                buffer+="$line"$'\n'
-            else
-                local status=$?
-                if [[ -n "$buffer" ]]; then
-                    flush_to_irc "$buffer" "$irc_in"
-                    buffer=""
+            sleep 0.5
+
+            local curr
+            curr=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || break
+            local curr_count
+            curr_count=$(printf '%s\n' "$curr" | wc -l)
+
+            # No change
+            [[ "$curr" == "$prev" ]] && continue
+
+            # Something changed, debounce until stable
+            local last_change=$SECONDS
+            while (( SECONDS - last_change < DEBOUNCE )); do
+                sleep 0.5
+                local check
+                check=$(tmux capture-pane -t "$TARGET" -e -p -S - 2>/dev/null) || break 2
+                if [[ "$check" != "$curr" ]]; then
+                    curr="$check"
+                    curr_count=$(printf '%s\n' "$curr" | wc -l)
+                    last_change=$SECONDS
                 fi
-                # Truncate file if over 1MB
-                if [[ $(stat -c%s "$pane_output" 2>/dev/null || echo 0) -gt 1048576 ]]; then
-                    : > "$pane_output"
+            done
+
+            # Stable - extract and send new lines
+            if [[ $curr_count -gt $prev_count ]]; then
+                local new_lines
+                new_lines=$(printf '%s\n' "$curr" | tail -n +$((prev_count + 1)))
+                # Trim trailing whitespace and skip empty lines
+                new_lines=$(printf '%s\n' "$new_lines" | sed 's/[[:space:]]*$//; /^$/d')
+                if [[ -n "$new_lines" ]]; then
+                    flush_to_irc "$new_lines" "$irc_in"
                 fi
-                # EOF (not timeout) means pipe closed
-                [[ $status -le 128 ]] && break
             fi
-        done < <(tail -n 0 -f "$pane_output")
+
+            prev="$curr"
+            prev_count=$curr_count
+        done
     ) &
     PIDS+=($!)
-    log "started debounce loop (pid $!)"
+    log "started output capture (pid $!)"
 }
 
 start_irc_to_tmux() {
@@ -223,7 +295,15 @@ start_irc_to_tmux() {
                     # Key sequence mode
                     local keys="${msg#!}"
                     log "keys from $sender: $keys"
-                    eval "tmux send-keys -t '$TARGET' $keys"
+                    if [[ "$keys" == *'\x'* ]] || [[ "$keys" == *'\e'* ]]; then
+                        # Raw escape sequences: interpret \x1b, \e, \n, etc.
+                        local interpreted
+                        interpreted=$(printf '%b' "$keys")
+                        tmux send-keys -t "$TARGET" -l "$interpreted"
+                    else
+                        # Tmux key names: C-c, Up, Enter, etc.
+                        eval "tmux send-keys -t '$TARGET' $keys"
+                    fi
                 else
                     # Literal text + Enter
                     log "text from $sender: $msg"
